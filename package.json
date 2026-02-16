@@ -4,7 +4,7 @@
   "description": "A lightning-fast WhatsApp bot with multi-device support, built on Node.js & Baileys.",
   "main": "index.js",
   "scripts": {
-    "start": "node --expose-gc --max-old-space-size=256 index.js"
+    "start": "node --expose-gc --max-old-space-size=400 index.js"
   },
   "engines": {
     "node": ">=20.x"
