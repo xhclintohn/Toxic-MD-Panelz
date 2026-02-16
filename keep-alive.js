@@ -1,34 +1,56 @@
 const http = require('http');
 const https = require('https');
 
-const PING_INTERVAL = 5 * 60 * 1000;
-const BOT_URL = process.env.BOT_URL || 'http://localhost:10000';
-
-function pingBot() {
-    const url = new URL(BOT_URL + '/ping');
-    const protocol = url.protocol === 'https:' ? https : http;
-    
-    const req = protocol.get(url, (res) => {
-        if (res.statusCode === 200) {
-            console.log(`✅ [${new Date().toLocaleTimeString()}] Bot is alive`);
-        }
-    });
-    
-    req.on('error', (error) => {
-        console.log(`⚠️ [${new Date().toLocaleTimeString()}] Ping failed:`, error.message);
-    });
-    
-    req.end();
+let rootSettings;
+try {
+    rootSettings = require('./settings');
+} catch (e) {
+    rootSettings = {};
 }
 
-console.log(`🔄 Keep-Alive Service Started`);
-console.log(`📍 Pinging: ${BOT_URL}`);
-console.log(`⏰ Interval: ${PING_INTERVAL / 1000}s\n`);
+const PING_INTERVAL = rootSettings.KEEP_ALIVE_INTERVAL || 4 * 60 * 1000;
+const BOT_URL = process.env.BOT_URL || 'http://localhost:' + (rootSettings.PORT || 10000);
+
+let consecutiveFailures = 0;
+const MAX_FAILURES = 5;
+
+function pingBot() {
+    try {
+        const url = new URL(BOT_URL + '/ping');
+        const protocol = url.protocol === 'https:' ? https : http;
+        
+        const req = protocol.get(url, { timeout: 10000 }, (res) => {
+            if (res.statusCode === 200) {
+                consecutiveFailures = 0;
+            } else {
+                consecutiveFailures++;
+            }
+            res.resume();
+        });
+        
+        req.on('error', (error) => {
+            consecutiveFailures++;
+            if (consecutiveFailures >= MAX_FAILURES) {
+                console.log(`⚠️ Bot unreachable ${consecutiveFailures} times`);
+            }
+        });
+
+        req.on('timeout', () => {
+            req.destroy();
+            consecutiveFailures++;
+        });
+        
+        req.end();
+    } catch (e) {}
+}
 
 pingBot();
 setInterval(pingBot, PING_INTERVAL);
 
 process.on('SIGINT', () => {
-    console.log('\n👋 Keep-Alive service stopped');
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
     process.exit(0);
 });

@@ -1,0 +1,8 @@
+node_modules/
+logs/
+Session/
+database/data/
+store.json
+src/store.json
+*.log
+.env

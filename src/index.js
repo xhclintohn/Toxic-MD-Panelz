@@ -22,8 +22,9 @@ const { exec, spawn, execSync } = require("child_process");
 const axios = require("axios");
 const chalk = require("chalk");
 const express = require("express");
+const rootSettings = require('../settings');
 const app = express();
-const port = process.env.PORT || 10000;
+const port = rootSettings.PORT;
 const PhoneNumber = require("awesome-phonenumber");
 const { imageToWebp, videoToWebp, writeExifImg, writeExifVid } = require('../lib/exif');
 const { isUrl, generateMessageTag, getBuffer, getSizeMedia, fetchJson, sleep } = require('../lib/botFunctions');
@@ -50,7 +51,7 @@ const antilink = require('../features/antilink');
 
 let cachedSettings = null;
 let settingsCacheTime = 0;
-const SETTINGS_CACHE_TTL = 60000;
+const SETTINGS_CACHE_TTL = rootSettings.SETTINGS_CACHE_TTL;
 
 async function getCachedSettings() {
     const now = Date.now();
@@ -88,7 +89,7 @@ function cleanupSessionFiles() {
                     const fileAge = Date.now() - stats.mtimeMs;
                     const hoursOld = fileAge / (1000 * 60 * 60);
 
-                    if (hoursOld > 24) {
+                    if (hoursOld > rootSettings.SESSION_CLEANUP_HOURS) {
                         fs.unlinkSync(filePath);
                     }
                 }
@@ -97,34 +98,63 @@ function cleanupSessionFiles() {
     } catch (error) {}
 }
 
-let cleanupInterval = null;
-let autobioInterval = null;
-let storeWriteInterval = null;
-let memoryCheckInterval = null;
+const activeIntervals = [];
+function safeSetInterval(fn, ms) {
+    const id = setInterval(fn, ms);
+    activeIntervals.push(id);
+    return id;
+}
+
+function clearAllIntervals() {
+    while (activeIntervals.length > 0) {
+        clearInterval(activeIntervals.pop());
+    }
+}
+
 let isRestarting = false;
+let reconnectTimeout = null;
+let activeClient = null;
 
 async function startToxic() {
   if (isRestarting) return;
   
-  if (cleanupInterval) clearInterval(cleanupInterval);
-  if (memoryCheckInterval) clearInterval(memoryCheckInterval);
-  
-  cleanupInterval = setInterval(cleanupSessionFiles, 12 * 60 * 60 * 1000);
+  clearAllIntervals();
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+
+  safeSetInterval(cleanupSessionFiles, 12 * 60 * 60 * 1000);
   cleanupSessionFiles();
 
-  memoryCheckInterval = setInterval(() => {
+  safeSetInterval(() => {
     try {
       const mem = process.memoryUsage();
       const usedMB = Math.round(mem.rss / 1024 / 1024);
-      if (usedMB > 400) {
+      if (usedMB > rootSettings.MAX_MEMORY_MB) {
         if (global.gc) global.gc();
+        if (store && store.messages) {
+          const jids = Object.keys(store.messages);
+          for (const jid of jids) {
+            const msgs = Object.keys(store.messages[jid]);
+            if (msgs.length > 50) {
+              const toRemove = msgs.slice(0, msgs.length - 50);
+              for (const id of toRemove) {
+                delete store.messages[jid][id];
+              }
+            }
+          }
+        }
       }
     } catch (e) {}
-  }, 10 * 60 * 1000);
+  }, 5 * 60 * 1000);
 
   let settingss = await getSettings();
   if (!settingss) {
     console.log(`❌ TOXIC-MD FAILED TO CONNECT - Settings not found`);
+    reconnectTimeout = setTimeout(() => {
+      startToxic();
+    }, 10000);
     return;
   }
 
@@ -140,12 +170,13 @@ async function startToxic() {
     printQRInTerminal: false,
     syncFullHistory: false,
     markOnlineOnConnect: false,
-    connectTimeoutMs: 90000,
+    connectTimeoutMs: rootSettings.CONNECT_TIMEOUT,
     defaultQueryTimeoutMs: 45000,
-    keepAliveIntervalMs: 30000,
+    keepAliveIntervalMs: rootSettings.KEEP_ALIVE_WS_INTERVAL,
     generateHighQualityLinkPreview: false,
     emitOwnEvents: false,
     fireInitQueries: false,
+    retryRequestDelayMs: 2000,
     getMessage: async (key) => {
       if (store) {
         const msg = await store.loadMessage(key.remoteJid, key.id);
@@ -183,18 +214,17 @@ async function startToxic() {
     }
   });
 
+  activeClient = client;
   store.bind(client.ev);
 
-  if (storeWriteInterval) clearInterval(storeWriteInterval);
-  storeWriteInterval = setInterval(() => {
+  safeSetInterval(() => {
     try {
       store.writeToFile("store.json");
     } catch (e) {}
-  }, 600000);
+  }, rootSettings.STORE_WRITE_INTERVAL);
 
-  if (autobioInterval) clearInterval(autobioInterval);
   if (autobio) {
-    autobioInterval = setInterval(() => {
+    safeSetInterval(() => {
       try {
         const date = new Date();
         client.updateProfileStatus(
@@ -206,7 +236,7 @@ async function startToxic() {
 
   const processedCalls = new Set();
 
-  setInterval(() => {
+  safeSetInterval(() => {
     processedCalls.clear();
   }, 10 * 60 * 1000);
 
@@ -217,31 +247,37 @@ async function startToxic() {
 
       const callId = json.content?.[0]?.attrs?.['call-id'];
       const callerJid = json.content?.[0]?.attrs?.['call-creator'];
+
       if (!callId || !callerJid) return;
 
-      const isGroupCall = callerJid.endsWith('@g.us');
-      if (isGroupCall) return;
-
-      const callerNumber = callerJid.replace(/[@.a-z]/g, "");
-
-      if (processedCalls.has(callId)) {
-        return;
-      }
+      if (processedCalls.has(callId)) return;
       processedCalls.add(callId);
+
+      const callerNumber = callerJid.split('@')[0];
+      const ownerJid = client.decodeJid(client.user.id);
+      if (callerJid === ownerJid) return;
 
       const fakeQuoted = {
         key: {
-          participant: '0@s.whatsapp.net',
-          remoteJid: '0@s.whatsapp.net',
-          id: callId
+          remoteJid: callerJid,
+          fromMe: false,
+          id: `TOXICCALL${Date.now()}`,
+          participant: callerJid
         },
         message: {
-          conversation: "Verified"
-        },
-        contextInfo: {
-          mentionedJid: [callerJid],
-          forwardingScore: 999,
-          isForwarded: true
+          extendedTextMessage: {
+            text: "Toxic-MD Anti-Call System",
+            contextInfo: {
+              externalAdReply: {
+                showAdAttribution: false,
+                title: "TOXIC-MD",
+                body: "Anti-Call Protection",
+                sourceUrl: "https://github.com/xhclintohn/Toxic-MD",
+                mediaType: 1,
+                renderLargerThumbnail: false
+              }
+            }
+          }
         }
       };
 
@@ -396,14 +432,6 @@ async function startToxic() {
     }
   });
 
-  process.on("unhandledRejection", (reason, promise) => {
-    console.error('❌ [UNHANDLED ERROR] Unhandled Rejection:', reason?.message?.substring(0, 200) || reason);
-  });
-
-  process.on("uncaughtException", (error) => {
-    console.error('❌ [UNCAUGHT ERROR]:', error?.message?.substring(0, 200) || error);
-  });
-
   client.decodeJid = (jid) => {
     if (!jid) return jid;
     if (/:\d+@/gi.test(jid)) {
@@ -444,9 +472,17 @@ async function startToxic() {
   });
 
   let reconnectAttempts = 0;
-  const maxReconnectAttempts = 20;
-  const baseReconnectDelay = 3000;
-  let reconnectTimeout = null;
+  const maxReconnectAttempts = rootSettings.MAX_RECONNECT_ATTEMPTS;
+  const baseReconnectDelay = rootSettings.RECONNECT_BASE_DELAY;
+
+  function scheduleReconnect(delay) {
+    if (reconnectTimeout) clearTimeout(reconnectTimeout);
+    isRestarting = true;
+    reconnectTimeout = setTimeout(() => {
+      isRestarting = false;
+      startToxic();
+    }, delay);
+  }
 
   client.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -470,26 +506,20 @@ async function startToxic() {
         reconnectTimeout = null;
       }
 
+      clearAllIntervals();
+
       if (reason === DisconnectReason.loggedOut || reason === 401) {
         try {
           fs.rmSync(sessionName, { recursive: true, force: true });
         } catch (e) {}
         invalidateSettingsCache();
-        isRestarting = true;
-        reconnectTimeout = setTimeout(() => {
-          isRestarting = false;
-          startToxic();
-        }, 3000);
+        scheduleReconnect(3000);
         return;
       }
 
       if (reason === DisconnectReason.restartRequired || reason === 515) {
         console.log('♻️ Restart required, restarting...');
-        isRestarting = true;
-        reconnectTimeout = setTimeout(() => {
-          isRestarting = false;
-          startToxic();
-        }, 2000);
+        scheduleReconnect(2000);
         return;
       }
 
@@ -502,11 +532,7 @@ async function startToxic() {
           const delay = Math.min(baseReconnectDelay * Math.pow(1.3, reconnectAttempts), 45000);
           reconnectAttempts++;
           console.log(`⏳ Connection lost (${reason}). Reconnecting in ${(delay/1000).toFixed(1)}s (attempt ${reconnectAttempts}/${maxReconnectAttempts})...`);
-          isRestarting = true;
-          reconnectTimeout = setTimeout(() => {
-            isRestarting = false;
-            startToxic();
-          }, delay);
+          scheduleReconnect(delay);
           return;
         }
       }
@@ -514,25 +540,15 @@ async function startToxic() {
       if (reconnectAttempts >= maxReconnectAttempts) {
         console.log(`❌ Max reconnection attempts reached. Restarting in 60s...`);
         reconnectAttempts = 0;
-        isRestarting = true;
-        reconnectTimeout = setTimeout(() => {
-          isRestarting = false;
-          startToxic();
-        }, 60000);
+        scheduleReconnect(60000);
         return;
       }
 
-      if (reconnectAttempts < maxReconnectAttempts) {
-        const delay = Math.min(baseReconnectDelay * Math.pow(1.5, reconnectAttempts), 45000);
-        reconnectAttempts++;
-        console.log(`⏳ Reconnecting in ${(delay/1000).toFixed(1)}s (attempt ${reconnectAttempts}/${maxReconnectAttempts})...`);
-        isRestarting = true;
-        reconnectTimeout = setTimeout(() => {
-          isRestarting = false;
-          startToxic();
-        }, delay);
-        return;
-      }
+      const delay = Math.min(baseReconnectDelay * Math.pow(1.5, reconnectAttempts), 45000);
+      reconnectAttempts++;
+      console.log(`⏳ Reconnecting in ${(delay/1000).toFixed(1)}s (attempt ${reconnectAttempts}/${maxReconnectAttempts})...`);
+      scheduleReconnect(delay);
+      return;
     }
 
     await connectionHandler(client, update, startToxic);
@@ -673,18 +689,14 @@ app.get("/status", (req, res) => {
 
 app.listen(port, () => console.log(`Server listening on port http://localhost:${port}`));
 
-setInterval(() => {
-  botStatus.lastPing = Date.now();
-}, 60000);
+process.on("unhandledRejection", (reason, promise) => {
+  console.error('❌ [UNHANDLED ERROR] Unhandled Rejection:', reason?.message?.substring(0, 200) || reason);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error('❌ [UNCAUGHT ERROR]:', error?.message?.substring(0, 200) || error);
+});
 
 startToxic();
 
 module.exports = { startToxic, invalidateSettingsCache };
-
-let file = require.resolve(__filename);
-fs.watchFile(file, () => {
-  fs.unwatchFile(file);
-  console.log(chalk.redBright(`Update ${__filename}`));
-  delete require.cache[file];
-  require(file);
-});
